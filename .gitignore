@@ -1,0 +1,20 @@
+# 构建产物
+build/
+.dart_tool/
+.gradle/
+*.apk
+*.aab
+*.so.*.log
+
+# 运行时负载（第三方二进制，走 Releases 分发）
+vela-flutter/android/app/src/main/assets/vela/
+
+# 本机路径
+local.properties
+.flutter-plugins-dependencies
+.idea/
+*.iml
+
+# 系统
+.DS_Store
+Thumbs.db
