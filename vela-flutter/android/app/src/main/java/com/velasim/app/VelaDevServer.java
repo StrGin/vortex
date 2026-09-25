@@ -60,9 +60,56 @@ public final class VelaDevServer {
     // ------------------------------------------------------------------- build
 
     /** Blocking build. Callers from the channel run this on the worker thread. */
+    /**
+     * manifest.json 少了 {@code permissions} 时提醒一声：快应用的网络访问要靠它授权，
+     * 缺了会表现成"接口全都请求失败"（实测 fetch 二十几毫秒就抛错），最难查。
+     */
+    private void warnIfNoNetPermission(String name, File dir) {
+        File manifest = new File(dir, "src/manifest.json");
+        if (!manifest.isFile()) {
+            return;
+        }
+        try {
+            org.json.JSONObject j = new org.json.JSONObject(VelaUtil.slurp(manifest));
+            org.json.JSONArray perms = j.optJSONArray("permissions");
+            boolean ok = false;
+            if (perms != null) {
+                for (int i = 0; i < perms.length(); i++) {
+                    org.json.JSONObject p = perms.optJSONObject(i);
+                    if (p != null && p.optString("origin", "").contains("*")) {
+                        ok = true;
+                        break;
+                    }
+                }
+            }
+            if (!ok) {
+                emit("build", name, "warn",
+                        "⚠ src/manifest.json 没有 permissions 声明：快应用联网要靠它授权，"
+                        + "缺了会表现成接口全部请求失败。建议加"
+                        + " \"permissions\": [{\"origin\": \"*\"}]");
+            }
+        } catch (Throwable t) {
+            VelaLog.w(TAG, "manifest 权限检查跳过: " + t);
+        }
+    }
+
+    /** 调试构建（`aiot build`）：热更新和 onboard 流程走这条。 */
     public Map<String, Object> build(String name) {
+        return build(name, "build");
+    }
+
+    /**
+     * 构建工程。
+     *
+     * @param task 工具链子命令：{@code release}（正式构建，工程页的「构建」按钮）
+     *             或 {@code build}（调试构建）。两者都带 {@code --enable-jsc}
+     *             ——客机 JS 运行时只认 QuickJS 字节码。
+     */
+    public Map<String, Object> build(String name, String task) {
+        final String taskName = task == null || task.trim().isEmpty() ? "build" : task.trim();
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("project", name);
+        out.put("task", taskName);
         if (!building.compareAndSet(false, true)) {
             out.put("ok", false);
             out.put("msg", "已有构建在跑，请等它结束");
@@ -71,7 +118,15 @@ public final class VelaDevServer {
         long t0 = System.currentTimeMillis();
         try {
             File dir = projects.require(name);
-            List<String> argv = toolchain.buildArgv(dir, "build");
+            warnIfNoNetPermission(name, dir);
+            if ("release".equals(taskName)) {
+                // release 缺证书时工具链只抛一句 "certification path"，先把它补上。
+                String note = toolchain.ensureReleaseSign(dir);
+                if (note != null) {
+                    emit("build", name, "sign", note);
+                }
+            }
+            List<String> argv = toolchain.buildArgv(dir, taskName);
             if (argv == null) {
                 out.put("ok", false);
                 out.put("msg", toolchain.missingWhy(dir));
@@ -94,7 +149,10 @@ public final class VelaDevServer {
                             emit("build", name, "out", l);
                             if (l.contains("build success")) {
                                 sawSuccess.set(true);
-                            } else if (l.contains("build error") || l.contains("ERROR:")) {
+                                // 工具链 2.0.x 里 "Build Error:" 才是真失败（catch 分支打的）；
+                                // 它结束时那句 "please use AIoT-IDE" 只是建议用官方 IDE 的提示，
+                                // 早期版本按 "ERROR:" 一概判错，结果构建成功也被当成失败。
+                            } else if (l.contains("Build Error:") || l.contains("build error")) {
                                 sawError.set(true);
                                 if (errLine.length() == 0) {
                                     errLine.append(l);
@@ -105,6 +163,8 @@ public final class VelaDevServer {
 
             lastBuildMs = System.currentTimeMillis() - t0;
             File rpk = VelaProjects.newestArtifact(dir);
+            // 增量构建（源码没变）时工具链几乎不输出、也不重打 rpk，但产物依然有效，
+            // 所以只看"退出码 0 + 有产物 + 没拿到 Build Error"。
             boolean ok = sawSuccess.get() || (code == 0 && rpk != null && !sawError.get());
             out.put("ok", ok);
             out.put("ms", lastBuildMs);
@@ -131,6 +191,7 @@ public final class VelaDevServer {
             Map<String, Object> ev = new LinkedHashMap<>();
             ev.put("type", "buildDone");
             ev.put("project", name);
+            ev.put("task", taskName);
             ev.put("ok", Boolean.TRUE.equals(out.get("ok")));
             ev.put("rpkPath", out.get("rpkPath"));
             ev.put("ms", lastBuildMs);

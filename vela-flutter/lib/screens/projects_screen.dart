@@ -129,54 +129,103 @@ class _ProjectsScreenState extends State<ProjectsScreen>
                 _ProjectTile(projects: p, project: pr),
             ],
           ),
-        if (p.importableProjects.isNotEmpty || !p.status.allFiles) ...[
-          const SizedBox(height: Insets.md),
-          SectionCard(
-            title: '从编辑面导入',
-            icon: Icons.move_to_inbox_outlined,
-            trailing: p.importableProjects.isEmpty
-                ? null
-                : StatusChip(label: '${p.importableProjects.length}'),
-            children: [
-              Padding(
-                padding: const EdgeInsets.fromLTRB(Insets.lg, 0, Insets.lg, Insets.xs),
-                child: Text(
-                  '把电脑上的工程拷到手机的 '
-                  '${p.status.publicDir.isEmpty ? '/sdcard/Vortex/projects' : p.status.publicDir} '
-                  '下（仓库里的 tools/push-project.sh 一条命令搞定），这里就会出现，导入后可直接构建。',
+        const SizedBox(height: Insets.md),
+        // 这张卡常显：以前没东西可导入时整块不渲染，用户以为 App 根本没有导入功能。
+        SectionCard(
+          title: '导入工程',
+          icon: Icons.move_to_inbox_outlined,
+          trailing: (p.pickedProjects.length + p.importableProjects.length) == 0
+              ? null
+              : StatusChip(
+                  label: '${p.pickedProjects.length + p.importableProjects.length}'),
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(Insets.lg, 0, Insets.lg, Insets.xs),
+              child: Text(
+                '点「导入 zip」挑一个工程压缩包，会自动解压（GitHub 下载的那层目录会剥掉）；'
+                '或者点「选择文件夹」直接挑手机里已解开的工程目录。'
+                '也可以把工程拷到 '
+                '${p.status.publicDir.isEmpty ? '/sdcard/Vortex/projects' : p.status.publicDir} '
+                '下，这里会自动列出来。',
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
+            ),
+            if (!p.status.allFiles)
+              ListTile(
+                leading: const Icon(Icons.folder_shared_outlined),
+                title: const Text('需要「所有文件访问」'),
+                subtitle: Text(
+                  'Android 11+ 读 /sdcard 需要它。点「去授权」打开系统页面，回来会自动刷新。',
                   style: Theme.of(context).textTheme.bodySmall,
                 ),
+                trailing: FilledButton.tonal(
+                  onPressed: () => state.bridge.openSettings(),
+                  child: const Text('去授权'),
+                ),
               ),
-              if (!p.status.allFiles)
-                ListTile(
-                  leading: const Icon(Icons.folder_shared_outlined),
-                  title: const Text('需要「所有文件访问」'),
-                  subtitle: Text(
-                    'Android 11+ 读 /sdcard 需要它。点「去授权」打开系统页面，回来会自动刷新。',
-                    style: Theme.of(context).textTheme.bodySmall,
-                  ),
-                  trailing: FilledButton.tonal(
-                    onPressed: () => state.bridge.openSettings(),
-                    child: const Text('去授权'),
-                  ),
+            if (p.pickedDir != null)
+              ListTile(
+                dense: true,
+                leading: const Icon(Icons.folder_open_outlined, size: 20),
+                title: Text(
+                  p.pickedDir!,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: Theme.of(context).textTheme.bodySmall,
                 ),
-              for (final pr in p.importableProjects)
-                ListTile(
-                  leading: const Icon(Icons.widgets_outlined),
-                  title: Text(pr.name),
-                  subtitle: Text(
-                    pr.package.isEmpty ? pr.path : pr.package,
-                    style: Theme.of(context).textTheme.bodySmall,
-                  ),
-                  trailing: FilledButton.tonal(
-                    onPressed:
-                        p.busy ? null : () => p.importFromPublic(pr.name),
-                    child: const Text('导入'),
-                  ),
+                trailing: TextButton(
+                  onPressed: p.busy ? null : p.clearPicked,
+                  child: const Text('清除'),
                 ),
-            ],
-          ),
-        ],
+              ),
+            for (final pr in p.pickedProjects)
+              _ImportTile(
+                project: pr,
+                exists: p.projects.any((x) => x.name == pr.name),
+                busy: p.busy,
+                onImport: () => _import(context, p, pr.path, pr.name),
+              ),
+            for (final pr in p.importableProjects)
+              _ImportTile(
+                project: pr,
+                exists: p.projects.any((x) => x.name == pr.name),
+                busy: p.busy,
+                onImport: () => _import(context, p, null, pr.name),
+              ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(Insets.lg, Insets.xs, Insets.lg, 0),
+              child: Wrap(
+                spacing: Insets.sm,
+                runSpacing: Insets.sm,
+                children: [
+                  FilledButton.icon(
+                    onPressed: p.busy ? null : () => _importZip(context, p),
+                    icon: const Icon(Icons.folder_zip_outlined, size: 18),
+                    label: const Text('导入 zip'),
+                  ),
+                  FilledButton.tonalIcon(
+                    onPressed: p.busy
+                        ? null
+                        : () async {
+                            final ok = await p.pickFolder();
+                            if (!ok && context.mounted) {
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                  const SnackBar(content: Text('没有选文件夹')));
+                            }
+                          },
+                    icon: const Icon(Icons.folder_open, size: 18),
+                    label: const Text('选择文件夹'),
+                  ),
+                  TextButton.icon(
+                    onPressed: p.busy ? null : () => p.refresh(),
+                    icon: const Icon(Icons.refresh, size: 18),
+                    label: const Text('刷新'),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
         const SizedBox(height: Insets.md),
         SectionCard(
           title: '构建输出',
@@ -303,6 +352,29 @@ class _ProjectTile extends StatelessWidget {
           spacing: Insets.sm,
           runSpacing: Insets.sm,
           children: [
+            // 构建（release）：产物落在工程 dist/<包名>.release.<版本>.rpk。
+            // 构建成功后主动问一句要不要用其他应用打开（「推送」那次构建不问）。
+            FilledButton.tonalIcon(
+              onPressed: projects.busy
+                  ? null
+                  : () async {
+                      final rpk = await projects.build(project.name);
+                      if (!context.mounted || rpk == null) {
+                        return;
+                      }
+                      final name = VelaProjects.artifactName(rpk);
+                      confirmAction(
+                        context,
+                        title: '构建完成',
+                        message: '已生成 $name\n\n要用其他应用打开它吗？',
+                        okLabel: '用其他应用打开',
+                        onOk: () => projects.openArtifact(project.name),
+                      );
+                    },
+              icon: const Icon(Icons.build_outlined, size: 18),
+              label: const Text('构建'),
+            ),
+            // 推送：debug 构建 → 装进手表 → 启动。
             FilledButton.tonalIcon(
               onPressed: projects.busy
                   ? null
@@ -310,15 +382,16 @@ class _ProjectTile extends StatelessWidget {
                       // 模拟器一次只跑一个客机，日志里带上目标设备，避免装错都不知道。
                       final st = AppScope.of(context);
                       final profile = st.selected;
-                      await projects.buildInstallLaunch(project.name,
-                          device: profile?.avdId, imageType: profile?.imageType);
+                      await projects.push(project.name,
+                          device: profile?.avdId,
+                          imageType: profile?.imageType);
                       if ((profile?.imageType ?? '').startsWith('vela-pre')) {
                         // 4.0 之前的镜像启动后屏幕是熄的：点一下电源键才看得见画面。
                         await st.bridge.key('Power');
                       }
                     },
-              icon: const Icon(Icons.rocket_launch_outlined, size: 18),
-              label: const Text('构建并安装启动'),
+              icon: const Icon(Icons.upload_outlined, size: 18),
+              label: const Text('推送'),
             ),
             OutlinedButton.icon(
               onPressed: () => Navigator.push(
@@ -341,6 +414,13 @@ class _ProjectTile extends StatelessWidget {
               label: Text(watching ? '停止热更新' : '热更新'),
             ),
             IconButton(
+              tooltip: '用其他应用打开产物',
+              icon: const Icon(Icons.open_in_new),
+              onPressed: projects.busy
+                  ? null
+                  : () => projects.openArtifact(project.name),
+            ),
+            IconButton(
               tooltip: '删除工程',
               icon: const Icon(Icons.delete_outline),
               onPressed: projects.busy ? null : () => projects.delete(project.name),
@@ -359,4 +439,84 @@ class _ProjectTile extends StatelessWidget {
       ],
     );
   }
+}
+
+/// 一条待导入的工程；同名已在工作区里时提示会覆盖。
+class _ImportTile extends StatelessWidget {
+  const _ImportTile({
+    required this.project,
+    required this.exists,
+    required this.busy,
+    required this.onImport,
+  });
+
+  final VelaProject project;
+  final bool exists;
+  final bool busy;
+  final VoidCallback onImport;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return ListTile(
+      leading: const Icon(Icons.widgets_outlined),
+      title: Text(project.name),
+      subtitle: Text(
+        exists
+            ? '工作区已有同名工程，导入会覆盖它的源码'
+            : (project.package.isEmpty ? project.path : project.package),
+        maxLines: 2,
+        overflow: TextOverflow.ellipsis,
+        style: Theme.of(context).textTheme.bodySmall?.copyWith(
+              color: exists ? scheme.error : scheme.onSurfaceVariant,
+            ),
+      ),
+      trailing: FilledButton.tonal(
+        onPressed: busy ? null : onImport,
+        child: const Text('导入'),
+      ),
+    );
+  }
+}
+
+/// [path] 为空表示走编辑面（/sdcard/Vortex/projects）那条老路。
+Future<void> _import(
+    BuildContext context, VelaProjects p, String? path, String name) async {
+  if (p.projects.any((x) => x.name == name)) {
+    confirmDestructive(
+      context,
+      title: '覆盖 $name？',
+      message: '工作区里已有同名工程，导入会覆盖它的源码文件（build、dist 等产物目录跳过，node_modules 会一起带过来）。',
+      okLabel: '覆盖导入',
+      onOk: () {
+        path == null ? p.importFromPublic(name) : p.importAt(path, name);
+      },
+    );
+    return;
+  }
+  path == null ? await p.importFromPublic(name) : await p.importAt(path, name);
+}
+
+/// 选 zip → 自动解压；撞名时先确认再解。
+Future<void> _importZip(BuildContext context, VelaProjects p) async {
+  final ok = await p.pickZip();
+  if (!context.mounted) {
+    return;
+  }
+  if (!ok) {
+    ScaffoldMessenger.of(context)
+        .showSnackBar(const SnackBar(content: Text('没有选 zip')));
+    return;
+  }
+  if (p.pendingZipExists) {
+    confirmDestructive(
+      context,
+      title: '覆盖 ${p.pendingZipName}？',
+      message: '工作区里已有同名工程，解压会覆盖它的源码文件（build、dist 等产物目录跳过，node_modules 会一起解出来）。',
+      okLabel: '覆盖导入',
+      onOk: () => p.importPickedZip(),
+    );
+    return;
+  }
+  await p.importPickedZip();
 }

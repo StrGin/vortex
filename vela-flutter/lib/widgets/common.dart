@@ -359,6 +359,38 @@ class LogPane extends StatelessWidget {
   }
 }
 
+/// 非破坏性操作的询问框：给一个主操作 + 一个"算了"。
+///
+/// 和 [confirmDestructive] 的区别只在配色与默认措辞——这里的主按钮是常规色，
+/// 因为像"构建完要不要用其他应用打开产物"这种问法并不危险。
+Future<void> confirmAction(
+  BuildContext context, {
+  required String title,
+  String? message,
+  String okLabel = '好',
+  String cancelLabel = '不用了',
+  required VoidCallback onOk,
+}) async {
+  final ok = await showDialog<bool>(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      title: Text(title),
+      content: message == null ? null : Text(message),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(ctx).pop(false),
+          child: Text(cancelLabel),
+        ),
+        FilledButton(
+          onPressed: () => Navigator.of(ctx).pop(true),
+          child: Text(okLabel),
+        ),
+      ],
+    ),
+  );
+  if (ok == true) onOk();
+}
+
 /// 破坏性操作的统一确认框（删除设备/镜像/工程、重启手表…）。
 Future<void> confirmDestructive(
   BuildContext context, {

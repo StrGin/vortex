@@ -562,6 +562,56 @@ public final class VelaEngine {
         return argv;
     }
 
+    private static boolean hasArg(List<String> argv, String flag) {
+        for (String s : argv) {
+            if (flag.equals(s)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * 手机当前在用的 DNS。优先问 ConnectivityManager；拿不到（私有 DNS、权限、
+     * 没网）就退回公共 DNS，否则客机一个域名都解析不了。
+     * 末尾再挂两个公共 DNS 兜底：客机的 DNS 解析偶发丢包（实测同一个域名
+     * 有时 1s 内回来、有时 30s 超时），多一路能少踩点。
+     */
+    private String hostDnsServers() {
+        StringBuilder sb = new StringBuilder();
+        try {
+            android.net.ConnectivityManager cm = (android.net.ConnectivityManager)
+                    ctx.getSystemService(Context.CONNECTIVITY_SERVICE);
+            android.net.Network net = cm == null ? null : cm.getActiveNetwork();
+            android.net.LinkProperties lp = net == null ? null : cm.getLinkProperties(net);
+            if (lp != null) {
+                for (java.net.InetAddress addr : lp.getDnsServers()) {
+                    String host = addr == null ? null : addr.getHostAddress();
+                    if (host == null || host.indexOf(':') >= 0) {
+                        continue; // 只喂 IPv4：客机的解析器不一定认 v6
+                    }
+                    if (sb.length() > 0) {
+                        sb.append(',');
+                    }
+                    sb.append(host);
+                }
+            }
+        } catch (Throwable t) {
+            VelaLog.w(TAG, "读系统 DNS 失败: " + t);
+        }
+        for (String fallback : new String[]{"223.5.5.5", "119.29.29.29"}) {
+            if (sb.indexOf(fallback) < 0) {
+                if (sb.length() > 0) {
+                    sb.append(',');
+                }
+                sb.append(fallback);
+            }
+        }
+        String out = sb.toString();
+        VelaLog.i(TAG, "客机 DNS <- " + out);
+        return out;
+    }
+
     private List<String> engineArgs(String avdId, Options o) {
         List<String> a = new ArrayList<>();
         int grpc = o.grpcPort != null ? o.grpcPort : GRPC_PORT;
@@ -576,6 +626,8 @@ public final class VelaEngine {
         a.add("-grpc");
         a.add(String.valueOf(grpc));
         a.add("-network-user-mode-options");
+        // 别加 ipv6=off：实测会让客机的请求全部超时（连二维码都拿不到），
+        // 原因是镜像 IPv6 栈的 RS/NS 无人应答，关掉 v6 反而把可用路径也堵了。
         a.add("hostfwd=tcp:127.0.0.1:" + debug + "-10.0.2.15:101");
         // Android has no desktop GL, so the engine must render through the
         // bundled SwiftShader backend (lib64/gles_swiftshader); with any other
@@ -596,6 +648,12 @@ public final class VelaEngine {
         }
         if (o.extraArgs != null && !o.extraArgs.trim().isEmpty()) {
             a.addAll(VelaUtil.splitArgs(o.extraArgs));
+        }
+        // 桌面宿主的引擎自己能从系统解析器读 DNS，Android 上没这条路（没有
+        // /etc/resolv.conf，net.dns1 也是空的），不喂给它客机就解析不了域名。
+        if (!hasArg(a, "-dns-server")) {
+            a.add("-dns-server");
+            a.add(hostDnsServers());
         }
         // -qemu starts the passthrough block consumed by qemu-system-armel.
         a.add("-qemu");

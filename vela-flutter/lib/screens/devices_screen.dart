@@ -101,6 +101,18 @@ class _AvdsCard extends StatelessWidget {
                     onPressed: () => state.startAvd(id),
                   ),
                   IconButton(
+                    tooltip: '清空数据',
+                    icon: const Icon(Icons.cleaning_services_outlined),
+                    onPressed: () => confirmDestructive(
+                      context,
+                      title: '清空 $id 的数据？',
+                      message: '设备里的装机记录、登录状态和设置都会清掉，下次启动从镜像重新铺一份。'
+                          '设备起不来、卡在开机界面时用它；清完第一次启动会慢一些（要初始化存储）。',
+                      okLabel: '清空',
+                      onOk: () => b.wipeAvd(id),
+                    ),
+                  ),
+                  IconButton(
                     tooltip: '删除',
                     icon: const Icon(Icons.delete_outline),
                     onPressed: () => confirmDestructive(

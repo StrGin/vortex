@@ -187,6 +187,14 @@ class VelaBridge {
   }
 
   Future<void> deleteAvd(String avdId) => _call('deleteAvd', {'avdId': avdId}).then((_) => refreshAvds());
+
+  /// 清空某台虚拟设备的数据分区（装机记录、设置全没），并从镜像重新铺一份。
+  /// AVD 起不来 / 卡在启动时，这是不用删设备重建的恢复手段。
+  Future<bool> wipeAvd(String avdId) async {
+    final r = await _call<Map<Object?, Object?>>('wipeAvd', {'avdId': avdId});
+    await refreshAvds();
+    return r?['ok'] == true;
+  }
   Future<void> downloadImage(String type) => _call('downloadImage', {'type': type});
   Future<void> deleteImage(String type) => _call('deleteImage', {'type': type}).then((_) => refreshImages());
   Future<void> stopEngine() async {

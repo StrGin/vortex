@@ -511,12 +511,23 @@ public final class VelaToolchain {
         }
         File pkgParent = new File(projectDir, "node_modules/@aiot-toolkit");
         File link = new File(pkgParent, "jsc");
-        if (link.exists()) {
-            return;
+        File target = jscPackageDir();
+        // 链接目标会随 App 更新失效（jsc 解包目录带版本/哈希）：断链时 exists() 是
+        // false，但路径还在，直接 symlink 会 EEXIST 失败，于是永远补不回来——
+        // 构建就报 "Cannot find module .../node_modules/@aiot-toolkit/jsc"。
+        if (VelaUtil.isLink(link)) {
+            if (link.exists() && VelaUtil.symlinkPointsTo(link, target)) {
+                return;
+            }
+            if (!VelaUtil.deleteRecursive(link)) {
+                link.delete();
+            }
+        } else if (link.exists()) {
+            return; // 工程自带的真目录，别动
         }
         pkgParent.mkdirs();
-        if (VelaUtil.symlink(jscPackageDir(), link)) {
-            VelaLog.i(TAG, "已链接 " + link + " -> " + jscPackageDir());
+        if (VelaUtil.symlink(target, link)) {
+            VelaLog.i(TAG, "已链接 " + link + " -> " + target);
         } else {
             VelaLog.w(TAG, "链不上 jsc 包，工具链会报找不到 @aiot-toolkit/jsc");
         }
@@ -1068,6 +1079,60 @@ public final class VelaToolchain {
             argv.add("-c");
             argv.add(onPath + " " + t);
             return argv;
+        }
+        return null;
+    }
+
+    // --------------------------------------------------------- release 签名
+
+    /**
+     * release（`production` 编译模式）**强制**要求工程里有签名证书，否则工具链直接抛
+     * {@code The current mode is production, and there is a problem with the certification path}
+     * ——实测就是这个错，跟别的构建错误完全不像，很容易被当成"代码有问题"。
+     *
+     * <p>工具链的查找顺序（{@code aiotpack/.../signature/SignUtil}）：
+     * {@code sign/release/{private,certificate}.pem} → {@code sign/{private,certificate}.pem}；
+     * 而 debug 模式最后还能退到工具链自带的 development 证书。所以工程里没有证书时，
+     * 我们就把工具链自带的那对放进 {@code sign/}（官方 IDE 的「生成签名」也是往这个目录写，
+     * 只是它让用户填国家/组织信息并用 openssl 现生成）。</p>
+     *
+     * @return 写进构建日志的一行说明；工程本来就带证书时返回 null
+     */
+    public String ensureReleaseSign(File projectDir) throws IOException {
+        File signDir = new File(projectDir, "sign");
+        File key = new File(signDir, "private.pem");
+        File cert = new File(signDir, "certificate.pem");
+        if (key.isFile() && cert.isFile()) {
+            return null; // 工程自带证书，尊重它
+        }
+        File pem = bundledSignDir(projectDir);
+        if (pem == null) {
+            return "⚠ 工程缺少 sign/private.pem + sign/certificate.pem，工具链里也没找到默认证书，release 构建会失败";
+        }
+        File keySrc = new File(pem, "private.pem");
+        File certSrc = new File(pem, "certificate.pem");
+        if (!keySrc.isFile() || !certSrc.isFile()) {
+            return "⚠ 工具链里的默认证书不完整：" + pem.getAbsolutePath();
+        }
+        if (!signDir.isDirectory() && !signDir.mkdirs()) {
+            throw new IOException("建不了 sign 目录: " + signDir.getAbsolutePath());
+        }
+        VelaUtil.copyFile(keySrc, key);
+        VelaUtil.copyFile(certSrc, cert);
+        return "🔑 工程没有签名证书，已放入工具链自带的那对 → sign/（换自己的证书就覆盖这两个文件）";
+    }
+
+    /** 工具链自带的 development 证书目录（release 在工程里找不到证书时用它兜底）。 */
+    private File bundledSignDir(File projectDir) {
+        String rel = "@aiot-toolkit/aiotpack/lib/compiler/javascript/vela/utils/signature/pem";
+        File[] roots = projectDir == null
+                ? new File[]{sharedModules()}
+                : new File[]{new File(projectDir, "node_modules"), sharedModules()};
+        for (File root : roots) {
+            File d = new File(root, rel);
+            if (new File(d, "private.pem").isFile() && new File(d, "certificate.pem").isFile()) {
+                return d;
+            }
         }
         return null;
     }

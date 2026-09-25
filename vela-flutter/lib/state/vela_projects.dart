@@ -108,6 +108,9 @@ class VelaProjects {
   /// Projects dropped into the phone's public edit surface
   /// (`/sdcard/Vortex/projects`) that are not in the private workspace yet.
   List<VelaProject> importableProjects = <VelaProject>[];
+  /// 用户在系统文件夹选择器里选的目录，以及它下面能找到的工程。
+  String? pickedDir;
+  List<VelaProject> pickedProjects = <VelaProject>[];
   List<String> installedApps = <String>[];
   final List<String> buildLog = <String>[];
   DevStatus status = const DevStatus();
@@ -237,6 +240,87 @@ class VelaProjects {
     return r != null;
   }
 
+  /// 弹系统文件夹选择器；选中的目录自己也可能是工程，否则列出它下面的工程。
+  /// 返回 false 表示用户取消或原生宿主不在。
+  Future<bool> pickFolder() async {
+    final r = await _call<Map<Object?, Object?>>('pickProjectFolder');
+    if (r == null) {
+      return false;
+    }
+    pickedDir = r['path'] == null ? null : '${r['path']}';
+    pickedProjects = ((r['projects'] as List?) ?? const [])
+        .whereType<Map<Object?, Object?>>()
+        .map(VelaProject.fromMap)
+        .toList();
+    onChange();
+    return true;
+  }
+
+  /// 从 [path] 导入一个工程（文件夹选择器选出来的那些）。
+  Future<bool> importAt(String path, String name) async {
+    busy = true;
+    onChange();
+    final r = await _call<Map<Object?, Object?>>(
+        'importProjectAt', {'path': path, 'name': name});
+    busy = false;
+    log(r == null
+        ? '❌ 导入失败: $name'
+        : '✅ 已导入 $name（${r['importedFiles']} 个文件）');
+    pickedProjects = pickedProjects.where((p) => p.path != path).toList();
+    await refresh();
+    return r != null;
+  }
+
+  void clearPicked() {
+    pickedDir = null;
+    pickedProjects = const [];
+    onChange();
+  }
+
+  /// 选中的 zip 会先解成什么工程（撞名要用户确认后再解）。
+  String? pendingZipToken;
+  String? pendingZipName;
+  bool pendingZipExists = false;
+
+  /// 用系统文件选择器挑一个 zip；返回 false 表示用户取消。
+  Future<bool> pickZip() async {
+    final r = await _call<Map<Object?, Object?>>('pickProjectZip');
+    if (r == null) {
+      return false;
+    }
+    pendingZipToken = r['token'] == null ? null : '${r['token']}';
+    pendingZipName = '${r['name'] ?? ''}';
+    pendingZipExists = r['exists'] == true;
+    onChange();
+    return pendingZipToken != null;
+  }
+
+  /// 解包 [pickZip] 选中的那只 zip。
+  Future<bool> importPickedZip() async {
+    final token = pendingZipToken;
+    if (token == null) {
+      return false;
+    }
+    busy = true;
+    onChange();
+    final r = await _call<Map<Object?, Object?>>('importPickedZip', {'token': token});
+    busy = false;
+    final name = '${r?['name'] ?? pendingZipName ?? ''}';
+    if (r == null) {
+      log('❌ 导入 zip 失败: $name');
+    } else {
+      log('✅ 已从 zip 导入 $name（${r['importedFiles']} 个文件）');
+      if (r['looksLikeProject'] != true) {
+        log('⚠️ $name 里没找到 src/manifest.json / app.json，可能不是快应用工程');
+      }
+    }
+    pendingZipToken = null;
+    pendingZipName = null;
+    pendingZipExists = false;
+    await refresh();
+    return r != null;
+  }
+
   Future<List<ProjectFile>> files(String name) async {
     final r = await _call<List<Object?>>('projectFiles', {'name': name});
     if (r == null) return const [];
@@ -250,14 +334,38 @@ class VelaProjects {
       await _call<bool>('writeProjectFile', {'name': name, 'path': path, 'content': content}) ==
       true;
 
-  Future<void> build(String name) async {
+  /// 构建工程；成功返回产出的 rpk 绝对路径，失败返回 null。
+  ///
+  /// [task] 直接交给工具链：`release`（正式构建，默认）或 `build`（调试构建）。
+  /// release 走 `production` 编译模式，产物叫 `<包名>.release.<版本>.rpk`；工具链在
+  /// 该模式下**强制要求**工程里有 `sign/private.pem` + `sign/certificate.pem`，
+  /// 缺失时原生侧会自动补上工具链自带的那套（构建日志里会写明）。
+  ///
+  /// 返回值给「构建完要不要用其他应用打开」那个询问用；[push] 里那次构建不看它。
+  Future<String?> build(String name, {String task = 'release'}) async {
     busy = true;
-    log('▶ 构建 $name');
+    log('▶ 构建 $name（${task == 'release' ? 'release' : 'debug'}）');
     onChange();
-    await _call<Map<Object?, Object?>>('buildProject', {'name': name});
-    // The native side may finish synchronously or stream buildDone events.
+    final r = await _call<Map<Object?, Object?>>(
+        'buildProject', {'name': name, 'task': task});
+    // buildDone 事件也会给 rpkPath，但事件可能晚到一步：直接用返回值兜底，
+    // 这样紧接着的「推送」一定装的是这次刚构建出来的那份。
+    final rpk = r?['rpkPath'];
+    if (rpk != null && '$rpk'.trim().isNotEmpty) {
+      lastRpkPath = '$rpk';
+    }
     busy = false;
     onChange();
+    return r?['ok'] == true ? lastRpkPath : null;
+  }
+
+  /// 产物文件名（询问框里显示用）。
+  static String artifactName(String? rpkPath) {
+    if (rpkPath == null || rpkPath.isEmpty) {
+      return '';
+    }
+    final i = rpkPath.lastIndexOf('/');
+    return i < 0 ? rpkPath : rpkPath.substring(i + 1);
   }
 
   Future<void> installAndLaunch(String name,
@@ -275,9 +383,37 @@ class VelaProjects {
     onChange();
   }
 
+  /// 推送：**debug 构建** → 装进客机 → 启动（原来「构建并安装启动」的行为）。
+  ///
+  /// 与「构建」的分工：构建出正式包（release，产物可分享/留存），推送走调试包
+  /// （编译快、带调试信息，热更新也是这条链路）。
+  Future<void> push(String name, {String? device, String? imageType}) async {
+    log('▶ 推送 $name（debug 构建 → 装机 → 启动）'
+        '${device == null ? '' : '，目标设备 $device'}');
+    await buildInstallLaunch(name,
+        device: device, imageType: imageType, task: 'build');
+  }
+
+  /// 用其他应用打开最新构建产物（原生侧会先导出到 `/sdcard/Vortex/rpk`，
+  /// 再交给系统的「打开方式」选择器）。
+  Future<void> openArtifact(String name) async {
+    final r = await _call<Map<Object?, Object?>>('openArtifact', {'name': name});
+    if (r == null) {
+      return;
+    }
+    if (r['ok'] == true) {
+      final where = '${r['exported'] ?? ''}'.trim();
+      log('📤 已用其他应用打开 ${r['file'] ?? name}${where.isEmpty ? '' : '（导出到 $where）'}');
+    } else {
+      log('❌ 打开产物失败：${r['msg'] ?? '未知原因'}');
+    }
+    onChange();
+  }
+
+  /// 构建 + 装机 + 启动。UI 的「推送」走这里（`task` 默认 debug，与推送语义一致）。
   Future<void> buildInstallLaunch(String name,
-      {String? device, String? imageType}) async {
-    await build(name);
+      {String? device, String? imageType, String task = 'build'}) async {
+    await build(name, task: task);
     await installAndLaunch(name,
         rpkPath: lastRpkPath, device: device, imageType: imageType);
     await refresh();

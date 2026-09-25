@@ -187,17 +187,27 @@ class VelaControlServer {
             .stopApp('${a['package'] ?? ''}', imageType: state.selected?.imageType);
         return {'ok': true};
       case 'build':
+        // 与 UI 的「构建」一致：只做 release 构建，产出正式包（不装机）。
+        final projects = state.projects.projects;
+        final project = '${a['project'] ?? (projects.isEmpty ? '' : projects.first.name)}';
+        if (project.isEmpty) return {'ok': false, 'error': '没有工程'};
+        final task = '${a['task'] ?? 'release'}' == 'build' ? 'build' : 'release';
+        state.projects.buildLog.clear();
+        // 构建是分钟级的：这里只**发起**，用 buildLog 轮询。
+        unawaited(state.projects.build(project, task: task));
+        return {'ok': true, 'started': true, 'project': project, 'task': task};
+      case 'push':
+        // 与 UI 的「推送」一致：debug 构建 + 装机 + 启动。
         final projects = state.projects.projects;
         final project = '${a['project'] ?? (projects.isEmpty ? '' : projects.first.name)}';
         if (project.isEmpty) return {'ok': false, 'error': '没有工程'};
         state.projects.buildLog.clear();
-        // 构建是分钟级的：这里只**发起**，用 buildLog 轮询。
-        unawaited(state.projects.buildInstallLaunch(
+        unawaited(state.projects.push(
           project,
           device: state.selected?.avdId,
           imageType: state.selected?.imageType,
         ));
-        return {'ok': true, 'started': true, 'project': project};
+        return {'ok': true, 'started': true, 'project': project, 'task': 'build'};
       case 'buildLog':
         final n = _num(a, 'lines', 80).round();
         final log = state.projects.buildLog;
@@ -375,7 +385,20 @@ class VelaControlServer {
       },
       'required': ['package'],
     }),
-    ('build', '发起工程构建（分钟级，异步）：随后用 buildLog 轮询输出', {
+    ('build', '发起工程构建（分钟级，异步）：随后用 buildLog 轮询输出。'
+        '默认 release 正式构建，传 task="build" 走调试构建', {
+      'type': 'object',
+      'properties': {
+        'project': {'type': 'string'},
+        'task': {
+          'type': 'string',
+          'enum': ['release', 'build'],
+          'description': 'release（默认，正式构建）/ build（调试构建）',
+        },
+      },
+    }),
+    ('push', '推送：debug 构建 → 装进客机 → 启动（同工程页的「推送」）。'
+        '随后用 buildLog 轮询输出', {
       'type': 'object',
       'properties': {
         'project': {'type': 'string'},

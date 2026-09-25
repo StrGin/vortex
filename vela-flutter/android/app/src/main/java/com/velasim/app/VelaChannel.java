@@ -7,10 +7,14 @@ import android.os.Build;
 import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
+import android.provider.DocumentsContract;
 import android.provider.Settings;
 
 import java.io.File;
+import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Iterator;
@@ -39,7 +43,12 @@ import io.flutter.plugin.common.MethodChannel;
  *     listProjects  createProject  deleteProject  projectFiles
  *     readProjectFile  writeProjectFile  buildProject  watchProject  devStatus
  *     installRpk  importRpkFromStorage  launchApp  stopApp  uninstallApp
- *     listInstalledApps
+ *     listInstalledApps  openArtifact
+ *
+ * <p>{@code buildProject} 的 {@code task}：{@code release}（工程页「构建」，产物
+ * {@code dist/<包名>.release.<版本>.rpk}）或 {@code build}（调试构建，工程页「推送」和
+ * 热更新都走这条）。{@code installRpk} 带 {@code rpkPath} 就装指定的那份，
+ * 不带则用最近一次构建的产物、再退到工程里最新的 rpk。</p>
  *   EventChannel   velasim/events   (JSON-friendly maps)
  *     {type:status, running, avd, pid, grpcPort}
  *     {type:log, line}
@@ -313,6 +322,161 @@ public final class VelaChannel {
             });
             return;
         }
+        // 系统文件夹选择器：结果要等用户选完，MethodChannel 的 result 一直挂着。
+        if ("pickProjectFolder".equals(method)) {
+            main.post(new Runnable() {
+                @Override
+                public void run() {
+                    boolean started = VelaFlutterActivity.pickFolder(new UriPick() {
+                        @Override
+                        public void onPicked(Uri uri) {
+                            final String path = uri == null ? null : resolveTreePath(uri);
+                            // inspect 会走整棵目录树，别压在主线程上。
+                            new Thread(new Runnable() {
+                                @Override
+                                public void run() {
+                                    try {
+                                        File dir = path == null ? null : new File(path);
+                                        final Object out =
+                                                (dir == null || !dir.isDirectory())
+                                                        ? null
+                                                        : projects().inspect(dir);
+                                        main.post(new Runnable() {
+                                            @Override
+                                            public void run() {
+                                                result.success(out);
+                                            }
+                                        });
+                                    } catch (Throwable t) {
+                                        failLater(result, method, t);
+                                    }
+                                }
+                            }).start();
+                        }
+                    });
+                    if (!started) {
+                        result.success(null); // 没有前台 Activity（桌面端）就当取消
+                    }
+                }
+            });
+            return;
+        }
+        // 选一个 zip 导入工程：拷进私有目录先看一眼，真正解包走 importPickedZip。
+        // 全程用选择器给的读权限，所以不需要「所有文件访问」。
+        if ("pickProjectZip".equals(method)) {
+            main.post(new Runnable() {
+                @Override
+                public void run() {
+                    boolean started = VelaFlutterActivity.pickZip(new UriPick() {
+                        @Override
+                        public void onPicked(Uri uri) {
+                            if (uri == null) {
+                                result.success(null);
+                                return;
+                            }
+                            new Thread(new Runnable() {
+                                @Override
+                                public void run() {
+                                    try {
+                                        File tmp = new File(ctx.getCacheDir(),
+                                                "import-" + System.currentTimeMillis() + ".zip");
+                                        InputStream in = ctx.getContentResolver().openInputStream(uri);
+                                        if (in == null) {
+                                            throw new IOException("读不到选中的文件");
+                                        }
+                                        OutputStream os = new FileOutputStream(tmp);
+                                        try {
+                                            byte[] buf = new byte[128 * 1024];
+                                            int n;
+                                            while ((n = in.read(buf)) > 0) {
+                                                os.write(buf, 0, n);
+                                            }
+                                        } finally {
+                                            VelaUtil.closeQuietly(in);
+                                            VelaUtil.closeQuietly(os);
+                                        }
+                                        final Object out = projects().peekZip(tmp);
+                                        main.post(new Runnable() {
+                                            @Override
+                                            public void run() {
+                                                result.success(out);
+                                            }
+                                        });
+                                    } catch (Throwable t) {
+                                        failLater(result, method, t);
+                                    }
+                                }
+                            }).start();
+                        }
+                    });
+                    if (!started) {
+                        result.success(null);
+                    }
+                }
+            });
+            return;
+        }
+        // 解包 pickProjectZip 看过的那只 zip（token 就是临时文件路径）
+        if ("importPickedZip".equals(method)) {
+            main.post(new Runnable() {
+                @Override
+                public void run() {
+                    new Thread(new Runnable() {
+                        @Override
+                        public void run() {
+                            File tmp = null;
+                            try {
+                                tmp = new File(str(args, "token"));
+                                final Object out = projects().importZip(tmp);
+                                main.post(new Runnable() {
+                                    @Override
+                                    public void run() {
+                                        result.success(out);
+                                    }
+                                });
+                            } catch (Throwable t) {
+                                failLater(result, method, t);
+                            } finally {
+                                if (tmp != null) {
+                                    //noinspection ResultOfMethodCallIgnored
+                                    tmp.delete();
+                                }
+                            }
+                        }
+                    }).start();
+                }
+            });
+            return;
+        }
+        // 用其他应用打开构建产物：拷贝走 worker 线程，跳到别的应用必须走主线程。
+        if ("openArtifact".equals(method)) {
+            main.post(new Runnable() {
+                @Override
+                public void run() {
+                    new Thread(new Runnable() {
+                        @Override
+                        public void run() {
+                            Map<String, Object> prepared;
+                            try {
+                                prepared = prepareArtifact(args);
+                            } catch (final Throwable t) {
+                                prepared = new LinkedHashMap<>();
+                                prepared.put("ok", false);
+                                prepared.put("msg", describe(t));
+                            }
+                            final Map<String, Object> r = prepared;
+                            main.post(new Runnable() {
+                                @Override
+                                public void run() {
+                                    result.success(openWithOtherApp(r));
+                                }
+                            });
+                        }
+                    }, "vela-openArtifact").start();
+                }
+            });
+            return;
+        }
         Worker w = workerFor(method);
         if (w == null) {
             result.notImplemented();
@@ -443,6 +607,13 @@ public final class VelaChannel {
                         return r;
                     }
                 };
+            case "wipeAvd":
+                return new Worker() {
+                    @Override
+                    public Object run(String m, Object args) {
+                        return wipeAvd(str(args, "avdId"));
+                    }
+                };
             case "startEngine":
                 return new Worker() {
                     @Override
@@ -506,6 +677,20 @@ public final class VelaChannel {
                         return projects().importFromPublic(str(args, "name"));
                     }
                 };
+            case "importProjectAt":
+                return new Worker() {
+                    @Override
+                    public Object run(String m, Object args) throws Exception {
+                        return projects().importFrom(new File(str(args, "path")), str(args, "name"));
+                    }
+                };
+            case "inspectProjectDir":
+                return new Worker() {
+                    @Override
+                    public Object run(String m, Object args) {
+                        return projects().inspect(new File(str(args, "path")));
+                    }
+                };
             case "createProject":
                 return new Worker() {
                     @Override
@@ -552,7 +737,8 @@ public final class VelaChannel {
                 return new Worker() {
                     @Override
                     public Object run(String m, Object args) {
-                        return dev().build(str(args, "name"));
+                        // task: release（工程页「构建」默认）或 build（调试构建）
+                        return dev().build(str(args, "name"), str(args, "task"));
                     }
                 };
             case "installRpk":
@@ -797,6 +983,17 @@ public final class VelaChannel {
         result.error(method, describe(t), rootCauseOf(t));
     }
 
+    /** 后台线程里出错时用：result.error 只能在主线程调。 */
+    private void failLater(final MethodChannel.Result result, final String method,
+                           final Throwable t) {
+        main.post(new Runnable() {
+            @Override
+            public void run() {
+                fail(result, method, t);
+            }
+        });
+    }
+
     // ------------------------------------------------------- quick handlers
 
     /** Empties the in-memory ring and deletes finished engine logs. */
@@ -921,6 +1118,344 @@ public final class VelaChannel {
         } catch (Exception e) {
             return "?";
         }
+    }
+
+    /** 文件夹/文件选择器的回调，在 main 线程上被调用；取消时 uri 为 null。 */
+    public interface UriPick {
+        void onPicked(Uri uri);
+    }
+
+    /** 清空某台虚拟设备的数据分区（装机记录、系统设置全没），并从镜像重新铺一份。 */
+    public Map<String, Object> wipeAvd(String avdId) {
+        Map<String, Object> r = new LinkedHashMap<>();
+        if (avdId == null || avdId.isEmpty()) {
+            r.put("ok", false);
+            r.put("error", "缺少 avdId");
+            return r;
+        }
+        VelaEngine e = engine();
+        Map<String, Object> st = e.status();
+        if (Boolean.TRUE.equals(st.get("running")) && avdId.equals(st.get("avd"))) {
+            e.stop();
+        }
+        r.put("ok", VelaAvd.wipeData(ctx, avdId));
+        r.put("avdId", avdId);
+        pushDevices();
+        pushStatus();
+        return r;
+    }
+
+    /**
+     * 无界面入口：不起 UI 也能驱动引擎、装 rpk、拉起客机应用，给 adb / 脚本 / AI 用。
+     * op = start | stop | status | install | launch | apps | logs | wipe。
+     */
+    public Map<String, Object> headless(String op, Map<String, Object> args) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        String what = op == null || op.isEmpty() ? "status" : op;
+        try {
+            switch (what) {
+                case "start": {
+                    Map<String, Object> a = new LinkedHashMap<>(args == null ? java.util.Collections.emptyMap() : args);
+                    if (str(a, "avdId") == null) {
+                        List<VelaAvd.Entry> avds = VelaAvd.listAll(ctx);
+                        if (avds.isEmpty()) {
+                            throw new IllegalStateException("一台虚拟设备都没有");
+                        }
+                        a.put("avdId", avds.get(0).avdId);
+                    }
+                    a.putIfAbsent("noAudio", Boolean.TRUE); // 无界面跑就别出声
+                    out.putAll((Map<String, Object>) startEngine(a));
+                    // 引擎是 App 的子进程：让 App 以前台服务活着，否则会被系统回收。
+                    VelaHeadlessService.keepAlive(ctx);
+                    break;
+                }
+                case "stop": {
+                    out.put("stopped", engine().stop());
+                    pushStatus();
+                    break;
+                }
+                case "install": {
+                    String rpkPath = str(args, "rpkPath");
+                    if (rpkPath == null) {
+                        throw new IllegalArgumentException("install 需要 rpkPath");
+                    }
+                    File rpk = new File(rpkPath);
+                    String pkg = str(args, "package");
+                    if (pkg == null || pkg.trim().isEmpty()) {
+                        pkg = packageFromRpkName(rpk);
+                    }
+                    String image = str(args, "imageType");
+                    boolean preImage = image != null && image.startsWith("vela-pre");
+                    final int port = intOrZero(args, "adbPort") > 0 ? intOrZero(args, "adbPort") : adbPort();
+                    out.putAll(VelaDeploy.installAndLaunch(rpk, pkg, port, VelaDeploy.freePort(),
+                            boolOr(args, "launch", true), preImage, new VelaDeploy.Log() {
+                                @Override
+                                public void line(String s) {
+                                    VelaLog.i("headless", s);
+                                }
+                            }));
+                    out.put("package", pkg);
+                    out.put("adbPort", port);
+                    pushInstalled(pkg, out.get("ok"));
+                    break;
+                }
+                case "launch": {
+                    String pkg = str(args, "package");
+                    if (pkg == null || pkg.trim().isEmpty()) {
+                        throw new IllegalArgumentException("launch 需要 package");
+                    }
+                    String image = str(args, "imageType");
+                    out.putAll(VelaDeploy.launch(pkg, adbPort(),
+                            image != null && image.startsWith("vela-pre")));
+                    break;
+                }
+                case "apps": {
+                    out.put("apps", VelaDeploy.listApps(adbPort(), new VelaDeploy.Log() {
+                        @Override
+                        public void line(String s) {
+                            VelaLog.i("headless", s);
+                        }
+                    }));
+                    break;
+                }
+                case "logs": {                    int lines = intArg(args, "lines", 0) > 0 ? intArg(args, "lines", 0) : 400;
+                    StringBuilder sb = new StringBuilder();
+                    sb.append("===== 引擎/串口日志（尾部 ").append(lines).append(" 行）=====\n");
+                    sb.append(engine().tail(lines)).append('\n');
+                    sb.append("\n===== App 日志 =====\n");
+                    sb.append(VelaLog.tail(lines)).append('\n');
+                    File dump = new File(Environment.getExternalStorageDirectory(),
+                            "Vortex/headless-log.txt");
+                    File parent = dump.getParentFile();
+                    if (parent != null) {
+                        parent.mkdirs();
+                    }
+                    try (OutputStream os = new FileOutputStream(dump)) {
+                        os.write(sb.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                    }
+                    out.put("logFile", dump.getAbsolutePath());
+                    out.put("bytes", dump.length());
+                    break;
+                }
+                case "wipe": {
+                    out.putAll(wipeAvd(str(args, "avdId")));
+                    break;
+                }
+                case "projects": {
+                    List<Map<String, Object>> list = new ArrayList<>();
+                    File root = projects().rootDir();
+                    File[] kids = root.listFiles();
+                    if (kids != null) {
+                        java.util.Arrays.sort(kids);
+                        for (File k : kids) {
+                            if (k.isDirectory()) {
+                                list.add(projects().info(k));
+                            }
+                        }
+                    }
+                    out.put("projects", list);
+                    out.put("importable", projects().importable());
+                    break;
+                }
+                case "import": {
+                    String name = str(args, "name");
+                    String path = str(args, "path");
+                    if (path != null && !path.isEmpty()) {
+                        out.putAll(projects().importFrom(new File(path), name));
+                    } else if (name != null && !name.isEmpty()) {
+                        out.putAll(projects().importFromPublic(name));
+                    } else {
+                        throw new IllegalArgumentException("import 需要 name（编辑面里的目录名）或 path");
+                    }
+                    break;
+                }
+                case "zip": {
+                    String path = str(args, "path");
+                    if (path == null || path.isEmpty()) {
+                        throw new IllegalArgumentException("zip 需要 path");
+                    }
+                    File z = new File(path);
+                    out.putAll(projects().importZip(z));
+                    break;
+                }
+                case "deploy": {
+                    String name = str(args, "name");
+                    if (name == null || name.isEmpty()) {
+                        throw new IllegalArgumentException("deploy 需要 name（工作区里的工程名）");
+                    }
+                    out.putAll(dev().buildInstallLaunch(name, adbPort(), str(args, "imageType")));
+                    break;
+                }
+                case "rm": {
+                    String name = str(args, "name");
+                    if (name == null || name.isEmpty()) {
+                        throw new IllegalArgumentException("rm 需要 name");
+                    }
+                    projects().delete(name);
+                    out.put("deleted", name);
+                    break;
+                }
+                case "toolchain": {
+                    // force=1：把已装的 node_modules 删掉再重装。装的时候是"存在就跳过"，
+                    // 缺文件（例如 @aiot-toolkit/jsc 没落位）时只能这样补。
+                    // 注意只删 node_modules：node/ 也在工具链目录里，删掉它构建会因为
+                    // 找不到 node 直接 exit=-1。
+                    if (boolOr(args, "force", false)) {
+                        File modules = new File(VelaToolchain.toolchainDir(ctx), "node_modules");
+                        out.put("removed", VelaUtil.deleteRecursive(modules));
+                    }
+                    out.putAll(toolchain().installToolkit(null, new VelaToolchain.Listener() {
+                        @Override
+                        public void onProgress(String phase, int percent, String detail) {
+                            VelaLog.i("toolchain", phase + " " + percent + "% " + detail);
+                        }
+                    }));
+                    break;
+                }
+                case "status":
+                default:
+                    break;
+            }
+            out.put("status", engine().status());
+            out.put("ok", !Boolean.FALSE.equals(out.get("ok")));
+        } catch (Throwable t) {
+            out.put("ok", false);
+            out.put("error", describe(t));
+        }
+        VelaLog.i("headless", what + " -> " + out);
+        return out;
+    }
+
+    /** {@code com.hyper.box.debug.1.0.0.rpk} → {@code com.hyper.box.debug}。 */
+    static String packageFromRpkName(File rpk) {
+        String n = rpk.getName();
+        if (n.endsWith(".rpk")) {
+            n = n.substring(0, n.length() - 4);
+        }
+        java.util.regex.Matcher m = java.util.regex.Pattern
+                .compile("^([a-zA-Z][a-zA-Z0-9_]*(?:\\.[a-zA-Z][a-zA-Z0-9_]*)+)")
+                .matcher(n);
+        return m.find() ? m.group(1) : n;
+    }
+
+    private void pushInstalled(String pkg, Object ok) {
+        Map<String, Object> ev = new LinkedHashMap<>();
+        ev.put("type", "installed");
+        ev.put("package", pkg);
+        ev.put("ok", ok);
+        emit("installed", ev);
+    }
+
+    /**
+     * 把 SAF 的 tree uri 还原成文件系统路径。primary 卷是 {@code primary:<相对路径>}，
+     * 可移动存储是 {@code <卷号>:<相对路径>}；配合「所有文件访问」直接按路径读写。
+     */
+    static String resolveTreePath(Uri uri) {
+        if (uri == null) {
+            return null;
+        }
+        String id;
+        try {
+            id = DocumentsContract.getTreeDocumentId(uri);
+        } catch (Throwable t) {
+            id = uri.getLastPathSegment();
+        }
+        if (id == null) {
+            return null;
+        }
+        if (id.startsWith("raw:")) {
+            return id.substring(4);
+        }
+        int c = id.indexOf(':');
+        String vol = c < 0 ? "primary" : id.substring(0, c);
+        String rel = c < 0 ? "" : id.substring(c + 1);
+        File base = "primary".equalsIgnoreCase(vol)
+                ? Environment.getExternalStorageDirectory()
+                : new File("/storage", vol);
+        return new File(base, rel).getAbsolutePath();
+    }
+
+    // ------------------------------------------------- 用其他应用打开产物
+
+    /**
+     * 找工程最新的 rpk，能写公共目录就顺手导出一份到 `/sdcard/Vortex/rpk`，
+     * 并算出可分享的 content URI。
+     */
+    private Map<String, Object> prepareArtifact(Object args) throws IOException {
+        Map<String, Object> r = new LinkedHashMap<>();
+        String name = str(args, "name");
+        if (name == null || name.isEmpty()) {
+            r.put("ok", false);
+            r.put("msg", "需要 name");
+            return r;
+        }
+        File dir = projects().require(name);
+        File rpk = VelaProjects.newestArtifact(dir);
+        if (rpk == null || !rpk.isFile()) {
+            r.put("ok", false);
+            r.put("msg", "工程里还没有 rpk 产物，先点「构建」");
+            return r;
+        }
+        File share = rpk;
+        File exported = null;
+        if (allFilesGranted()) {
+            // 导出到公共目录：文件管理器里也能直接看到，方便自己再传给别人。
+            File pub = new File(Environment.getExternalStorageDirectory(),
+                    VelaProjects.RPK_SUBDIR);
+            if (pub.isDirectory() || pub.mkdirs()) {
+                File dst = new File(pub, rpk.getName());
+                copyFile(rpk, dst);
+                exported = dst;
+                share = dst;
+            }
+        }
+        Uri uri = VelaFileProvider.uriFor(ctx, share);
+        if (uri == null) {
+            r.put("ok", false);
+            r.put("msg", "产物在可分享目录之外：" + share.getAbsolutePath());
+            return r;
+        }
+        r.put("ok", true);
+        r.put("file", rpk.getName());
+        r.put("source", rpk.getAbsolutePath());
+        r.put("exported", exported == null ? null : exported.getAbsolutePath());
+        r.put("uri", uri.toString());
+        r.put("bytes", share.length());
+        return r;
+    }
+
+    /** 交给系统「打开方式」选择器；没有应用能 VIEW 就退到分享。 */
+    private Object openWithOtherApp(Map<String, Object> r) {
+        if (!Boolean.TRUE.equals(r.get("ok"))) {
+            return r;
+        }
+        Uri uri = Uri.parse(String.valueOf(r.get("uri")));
+        String mime = "application/octet-stream";
+        int grant = Intent.FLAG_GRANT_READ_URI_PERMISSION;
+        try {
+            Intent view = new Intent(Intent.ACTION_VIEW).setDataAndType(uri, mime).addFlags(grant);
+            boolean canView = !ctx.getPackageManager()
+                    .queryIntentActivities(view, 0).isEmpty();
+            Intent target;
+            if (canView) {
+                target = view;
+            } else {
+                target = new Intent(Intent.ACTION_SEND)
+                        .setType(mime)
+                        .putExtra(Intent.EXTRA_STREAM, uri)
+                        .addFlags(grant);
+            }
+            Intent chooser = Intent.createChooser(target, canView ? "用其他应用打开" : "发送 rpk 到");
+            chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | grant);
+            ctx.startActivity(chooser);
+            r.put("opened", true);
+            r.put("via", canView ? "view" : "send");
+        } catch (Throwable t) {
+            r.put("ok", false);
+            r.put("msg", "打不开选择器：" + describe(t)
+                    + (r.get("exported") == null ? "" : "；文件已导出到 " + r.get("exported")));
+        }
+        return r;
     }
 
     private Map<String, Object> openAppSettings() {
@@ -1080,6 +1615,18 @@ public final class VelaChannel {
 
     /** Emits {@code {type: kind, ...payload}} to Dart. */
     public void emit(String kind, Map<String, Object> payload) {
+        // 构建/装机这类长流程的输出也写一份进日志：界面上有「构建输出」面板，
+        // 但无界面跑（脚本/CI）时只有日志能看到它。
+        if (payload != null && ("build".equals(kind) || "buildDone".equals(kind)
+                || "installed".equals(kind))) {
+            Object line = payload.get("line");
+            if (line == null) {
+                line = payload.get("msg");
+            }
+            if (line != null) {
+                VelaLog.i("build", String.valueOf(line));
+            }
+        }
         final EventChannel.EventSink s = sink;
         if (s == null) {
             return;

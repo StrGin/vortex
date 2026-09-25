@@ -9,6 +9,10 @@ build/
 # 运行时负载（第三方二进制，走 Releases 分发）
 vela-flutter/android/app/src/main/assets/vela/
 
+# Flutter 桌面脚手架：本项目只出 Android（arm64），windows/ 是 flutter create 留下的
+# 自动生成物，含 flutter_windows.dll / icudtl.dat / .pdb 等几十 MB 二进制，不入库。
+vela-flutter/windows/
+
 # 本机路径
 local.properties
 .flutter-plugins-dependencies

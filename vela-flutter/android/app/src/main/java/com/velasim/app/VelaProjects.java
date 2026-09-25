@@ -51,16 +51,24 @@ public final class VelaProjects {
     /** 公共编辑面（/sdcard/Vortex/projects）；镜像导入也扫它的父目录。 */
     public static final String PUBLIC_SUBDIR = "Vortex/projects";
 
+    /** 工程页「用其他应用打开」把 rpk 导出到这里，文件管理器里也能直接看到。 */
+    public static final String RPK_SUBDIR = "Vortex/rpk";
+
     private static final String TAG = "projects";
     private static final long MAX_TEXT_READ = 2L * 1024 * 1024;
     private static final long MAX_TEXT_WRITE = 4L * 1024 * 1024;
     /** 镜像进公共目录的单文件上限：比这大的不是源码。 */
     private static final long MIRROR_FILE_LIMIT = 4L * 1024 * 1024;
 
-    /** 不参与列目录/镜像的目录名。 */
+    /**
+     * 不参与列目录/镜像的目录名。
+     *
+     * <p>{@code sign} 也要跳过：release 构建的签名私钥（{@code sign/private.pem}）不能跟着
+     * 工程一起镜像到公共目录 {@code /sdcard/Vortex/projects}——那里任何应用都读得到。</p>
+     */
     private static final List<String> SKIP_DIRS =
             Collections.unmodifiableList(Arrays.asList("node_modules", "build", ".git", "dist",
-                    ".husky", ".idea", ".vscode", "coverage", "logs"));
+                    ".husky", ".idea", ".vscode", "coverage", "logs", "sign"));
 
     private static final String DEFAULT_PACKAGE_PREFIX = "xiaomi.mobile.mina.";
     private static final String DEFAULT_MIN_PLATFORM = "1070";
@@ -291,7 +299,30 @@ public final class VelaProjects {
     }
 
     private static boolean isProject(File dir) {
-        return new File(dir, "src/manifest.json").isFile() || new File(dir, "package.json").isFile();
+        return new File(dir, "src/manifest.json").isFile()
+                || new File(dir, "package.json").isFile()
+                || new File(dir, "app.json").isFile();
+    }
+
+    /** 一个候选工程目录的摘要，导入列表与「选目录」共用。 */
+    private Map<String, Object> summary(File k) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("name", k.getName());
+        m.put("path", k.getAbsolutePath());
+        m.put("publicPath", k.getAbsolutePath());
+        m.put("bytes", VelaImageStore.dirSize(k));
+        m.put("sourceFiles", countSourceFiles(k, 0));
+        File manifest = new File(k, "src/manifest.json");
+        if (manifest.isFile()) {
+            try {
+                JSONObject j = new JSONObject(VelaUtil.slurp(manifest));
+                m.put("package", j.optString("package", ""));
+                m.put("title", j.optString("name", k.getName()));
+                m.put("versionName", j.optString("versionName", ""));
+            } catch (Exception ignored) {
+            }
+        }
+        return m;
     }
 
     /**
@@ -312,30 +343,210 @@ public final class VelaProjects {
             if (dirFor(k.getName()).isDirectory()) {
                 continue;
             }
-            Map<String, Object> m = new LinkedHashMap<>();
-            m.put("name", k.getName());
-            m.put("path", k.getAbsolutePath());
-            m.put("publicPath", k.getAbsolutePath());
-            m.put("bytes", VelaImageStore.dirSize(k));
-            m.put("sourceFiles", countSourceFiles(k, 0));
-            File manifest = new File(k, "src/manifest.json");
-            if (manifest.isFile()) {
-                try {
-                    JSONObject j = new JSONObject(VelaUtil.slurp(manifest));
-                    m.put("package", j.optString("package", ""));
-                    m.put("title", j.optString("name", k.getName()));
-                    m.put("versionName", j.optString("versionName", ""));
-                } catch (Exception ignored) {
-                }
-            }
-            out.add(m);
+            out.add(summary(k));
         }
         return out;
     }
 
     /**
+     * 用户在系统文件夹选择器里选了某个目录之后：目录自己就是工程就返回它，
+     * 否则把它下面能当工程的子目录列出来。
+     */
+    public Map<String, Object> inspect(File dir) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("path", dir.getAbsolutePath());
+        m.put("name", dir.getName());
+        m.put("isProject", isProject(dir));
+        List<Map<String, Object>> found = new ArrayList<>();
+        if (isProject(dir)) {
+            found.add(summary(dir));
+        } else {
+            File[] kids = dir.listFiles();
+            if (kids != null) {
+                Arrays.sort(kids);
+                for (File k : kids) {
+                    if (k.isDirectory() && isProject(k) && !dirFor(k.getName()).isDirectory()) {
+                        found.add(summary(k));
+                    }
+                }
+            }
+        }
+        m.put("projects", found);
+        return m;
+    }
+
+    /** 从手机任意目录导入一个工程；{@code nameOverride} 空则用目录名。 */
+    public Map<String, Object> importFrom(File src, String nameOverride) throws IOException {        if (src == null || !src.isDirectory()) {
+            throw new IOException("目录不存在：" + (src == null ? "?" : src.getAbsolutePath()));
+        }
+        if (!isProject(src)) {
+            throw new IOException("不是快应用工程（缺 src/manifest.json / app.json / package.json）："
+                    + src.getAbsolutePath());
+        }
+        String name = sanitize(nameOverride == null || nameOverride.trim().isEmpty()
+                ? src.getName() : nameOverride);
+        File priv = dirFor(name);
+        String s = src.getAbsolutePath();
+        String p = priv.getAbsolutePath();
+        // 源目录和工作区互相包含时整树拷贝会自吞，直接拒绝
+        if (s.equals(p) || s.startsWith(p + File.separator) || p.startsWith(s + File.separator)) {
+            throw new IOException("这个目录在应用工作区里面，不能导入：" + s);
+        }
+        if (!priv.isDirectory() && !priv.mkdirs() && !priv.isDirectory()) {
+            throw new IOException("无法创建工程目录 " + p);
+        }
+        int[] copied = {0};
+        pullTree(src, priv, copied, true);
+        if (copied[0] == 0) {
+            throw new IOException("没拷到任何源码文件，检查一下目录内容：" + s);
+        }
+        VelaLog.i(TAG, "从 " + s + " 导入 " + name + "（" + copied[0] + " 个文件）");
+        Map<String, Object> m = info(priv);
+        m.put("importedFiles", copied[0]);
+        return m;
+    }
+
+    /** zip 里所有文件是否都套在同一个顶层目录下（GitHub 导出的 zip 都这样）。 */
+    private static String commonTopDir(java.util.zip.ZipFile zf) {
+        String found = null;
+        java.util.Enumeration<? extends java.util.zip.ZipEntry> en = zf.entries();
+        while (en.hasMoreElements()) {
+            String n = en.nextElement().getName().replace('\\', '/');
+            if (n.isEmpty() || n.endsWith("/") || skipZipEntry(n)) {
+                continue;
+            }
+            int slash = n.indexOf('/');
+            if (slash <= 0) {
+                return null; // 顶层直接躺着文件，说明没有统一的包裹目录
+            }
+            String top = n.substring(0, slash);
+            if (found == null) {
+                found = top;
+            } else if (!found.equals(top)) {
+                return null;
+            }
+        }
+        return found;
+    }
+
+    private static boolean skipZipEntry(String n) {
+        String low = n.toLowerCase(java.util.Locale.ROOT);
+        return low.startsWith("__macosx/") || low.contains("/__macosx/")
+                || low.endsWith(".ds_store") || low.endsWith("/thumbs.db");
+    }
+
+    /** zip 会解成什么工程名：优先取包裹目录名，没有就取 zip 文件名（已 sanitize）。 */
+    private static String zipProjectName(File zip) throws IOException {
+        String top;
+        try (java.util.zip.ZipFile zf = new java.util.zip.ZipFile(zip)) {
+            top = commonTopDir(zf);
+        }
+        String base = zip.getName();
+        int dot = base.lastIndexOf('.');
+        if (dot > 0) {
+            base = base.substring(0, dot);
+        }
+        return sanitize(top != null && !top.isEmpty() ? top : base);
+    }
+
+    /** 选完 zip 先看一眼：会解成什么名字、工作区里有没有同名工程。 */
+    public Map<String, Object> peekZip(File zip) throws IOException {
+        if (zip == null || !zip.isFile()) {
+            throw new IOException("找不到 zip：" + (zip == null ? "?" : zip.getAbsolutePath()));
+        }
+        String name = zipProjectName(zip);
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("token", zip.getAbsolutePath());
+        m.put("name", name);
+        m.put("exists", dirFor(name).isDirectory());
+        m.put("bytes", zip.length());
+        return m;
+    }
+
+    /**
+     * 解开 {@code peekZip} 看过的那只 zip：自动剥掉包裹目录（GitHub 导出的 zip 都带一层），
+     * 工程名同 {@link #zipProjectName}。build/dist 等产物目录按 SKIP_DIRS 跳过，node_modules 保留；
+     * 同名工程的既有源码文件按覆盖处理，不删它已有的目录。
+     */
+    public Map<String, Object> importZip(File zip) throws IOException {
+        if (zip == null || !zip.isFile()) {
+            throw new IOException("找不到 zip：" + (zip == null ? "?" : zip.getAbsolutePath()));
+        }
+        String top;
+        try (java.util.zip.ZipFile zf = new java.util.zip.ZipFile(zip)) {
+            top = commonTopDir(zf);
+        }
+        String name = zipProjectName(zip);
+        File priv = dirFor(name);
+        if (!priv.isDirectory() && !priv.mkdirs() && !priv.isDirectory()) {
+            throw new IOException("无法创建工程目录 " + priv.getAbsolutePath());
+        }
+        String privCanon = priv.getCanonicalPath() + File.separator;
+        int copied = 0;
+        try (java.util.zip.ZipFile zf = new java.util.zip.ZipFile(zip)) {
+            java.util.Enumeration<? extends java.util.zip.ZipEntry> en = zf.entries();
+            while (en.hasMoreElements()) {
+                java.util.zip.ZipEntry e = en.nextElement();
+                String raw = e.getName().replace('\\', '/');
+                if (e.isDirectory() || skipZipEntry(raw)) {
+                    continue;
+                }
+                String rel = raw;
+                if (top != null && !top.isEmpty()) {
+                    if (!raw.startsWith(top + "/")) {
+                        continue;
+                    }
+                    rel = raw.substring(top.length() + 1);
+                }
+                while (rel.startsWith("./") || rel.startsWith("/")) {
+                    rel = rel.substring(rel.startsWith("./") ? 2 : 1);
+                }
+                if (rel.isEmpty() || rel.contains("../")) {
+                    continue;
+                }
+                int slash = rel.indexOf('/');
+                if (slash > 0 && SKIP_DIRS.contains(rel.substring(0, slash))
+                        && !"node_modules".equals(rel.substring(0, slash))) {
+                    continue;
+                }
+                File out = new File(priv, rel);
+                if (!out.getCanonicalPath().startsWith(privCanon)) {
+                    VelaLog.w(TAG, "跳过越界的 zip 条目: " + raw);
+                    continue;
+                }
+                File parent = out.getParentFile();
+                if (parent != null && !parent.isDirectory() && !parent.mkdirs() && !parent.isDirectory()) {
+                    throw new IOException("建不了目录 " + parent.getAbsolutePath());
+                }
+                InputStream in = zf.getInputStream(e);
+                OutputStream os = new FileOutputStream(out);
+                try {
+                    byte[] buf = new byte[64 * 1024];
+                    int n;
+                    while ((n = in.read(buf)) > 0) {
+                        os.write(buf, 0, n);
+                    }
+                } finally {
+                    VelaUtil.closeQuietly(in);
+                    VelaUtil.closeQuietly(os);
+                }
+                copied++;
+            }
+        }
+        if (copied == 0) {
+            throw new IOException("zip 里没解出源码文件：" + zip.getName());
+        }
+        boolean ok = isProject(priv);
+        VelaLog.i(TAG, "从 zip 导入 " + name + "（" + copied + " 个文件，像工程=" + ok + "）");
+        Map<String, Object> m = info(priv);
+        m.put("importedFiles", copied);
+        m.put("looksLikeProject", ok);
+        return m;
+    }
+
+    /**
      * 公共 -&gt; 私有 的整树导入；工程名冲突时覆盖私有侧的源码文件（node_modules 等
-     * 依赖/产物目录按 SKIP_DIRS 跳过，重新构建时工具链会自己装）。
+     * 产物目录按 SKIP_DIRS 跳过；带依赖的工程连 node_modules 一起搬）。
      */
     public Map<String, Object> importFromPublic(String name) throws IOException {
         File pub = publicDirFor(name);
@@ -351,7 +562,7 @@ public final class VelaProjects {
             throw new IOException("无法创建工程目录 " + priv.getAbsolutePath());
         }
         int[] copied = {0};
-        pullTree(pub, priv, copied);
+        pullTree(pub, priv, copied, true);
         VelaLog.i(TAG, "从编辑面导入 " + name + "（" + copied[0] + " 个文件）");
         Map<String, Object> m = info(priv);
         m.put("importedFiles", copied[0]);
@@ -740,20 +951,31 @@ public final class VelaProjects {
     }
 
     private void pullTree(File pub, File priv, int[] copied) throws IOException {
+        pullTree(pub, priv, copied, false);
+    }
+
+    /**
+     * {@code keepNodeModules=true} 时连 {@code node_modules} 一起搬：工程带了依赖
+     * （或自己钉了工具链版本）就必须留着，否则一构建就找不到 dayjs 这类包。
+     */
+    private void pullTree(File pub, File priv, int[] copied, boolean keepNodeModules)
+            throws IOException {
         File[] kids = pub.listFiles();
         if (kids == null) {
             return;
         }
         for (File k : kids) {
             if (k.isDirectory() && SKIP_DIRS.contains(k.getName())) {
-                continue;
+                if (!(keepNodeModules && "node_modules".equals(k.getName()))) {
+                    continue;
+                }
             }
             File target = new File(priv, k.getName());
             if (k.isDirectory()) {
                 if (!target.isDirectory()) {
                     target.mkdirs();
                 }
-                pullTree(k, target, copied);
+                pullTree(k, target, copied, keepNodeModules);
                 continue;
             }
             if (!k.isFile() || k.length() > MIRROR_FILE_LIMIT) {
